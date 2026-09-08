@@ -1,215 +1,225 @@
-# fde-takehome
+# fde-takehome — engineering notes
 
-Take-home assessment repo for a Forward Deployed Engineer (FDE) / AI
-Integration Engineer role. Source spec: "FDE Assessment Questions - MCP &
-LLM Gateways.pdf". The spec's overview line claims "5 practical technical
-tasks" but only 4 are actually detailed in the document — this repo tracks
-those 4 as the deliverables. Worth double-checking against the original doc
-in case a Task 5 exists elsewhere.
+## Project purpose
 
-## The four tasks
+Assessment submission implementing four components against a single
+specification ("FDE Assessment Questions - MCP & LLM Gateways"): an MCP
+server (Task 1), an MCP security gateway (Task 2), an LLM gateway with
+streaming PII redaction (Task 3), and a token-aware rate limiter with model
+failover (Task 4). Two mock upstreams (`mocks/mcp_downstream.py`,
+`mocks/llm_provider.py`) stand in for a real MCP server and a real LLM
+provider so Tasks 2–4 have something concrete to run against.
 
-### Task 1 — MCP server with strict validation & transport handling
-Runnable MCP server (Python, official `mcp` SDK) exposing two tools:
-- `get_customer_record` — input `customer_id: str` formatted `CUST-XXXXX`.
-- `trigger_refund` — inputs `customer_id`, `amount` (positive float),
-  `reason` (string, min length 10).
+The specification's overview line states "5 practical technical tasks";
+only four are detailed in the document. No separate fifth task was located
+in the supplied material. This repository implements the four detailed
+tasks.
 
-Requirements: strict Pydantic schema validation with standard MCP JSON-RPC
-error codes on invalid input; stdio transport; stdout reserved *exclusively*
-for JSON-RPC messages, all logs/debug output on stderr.
+See `README.md` for the full architecture, request flows, task-by-task
+explanation, and manual verification commands. This file is the engineering
+decision log: why things are built the way they are, not what they do.
 
-Evaluation criteria:
-- **STDIO isolation** — stdout is pure JSON-RPC, no stray `print`/`console.log`.
-- **Protocol compliance** — correct JSON-RPC error mapping and execution flow.
-- **Validation** — robust schemas, solid edge-case handling for malformed input.
+## Stack
 
-### Task 2 — MCP security gateway (tool filtering & auth)
-HTTP/JSON-RPC reverse proxy sitting between an AI agent client and a
-downstream MCP server. Reads `Bearer <token>` to derive a role (`admin` /
-`viewer`). `tools/list` forwards transparently. `tools/call` inspects
-`params.name`: if it starts with `admin_`, the caller must have role
-`admin`, else intercept and return JSON-RPC error `-32001 Unauthorized Tool
-Call` without touching the downstream server.
-
-Evaluation criteria:
-- Correct JSON-RPC wire format parsing.
-- Clean proxy middleware / request-response forwarding.
-- Fine-grained, method-level authorization logic and clean error handling.
-
-### Task 3 — LLM gateway streaming guardrail (PII redaction)
-LLM Gateway proxy endpoint that routes text generation requests to an LLM
-provider and streams the response back to the client, redacting PII
-(emails, SSNs, credit card numbers → `[REDACTED]`) from the stream in real
-time, including patterns that straddle chunk boundaries.
-
-Evaluation criteria:
-- Efficient async stream chunking and buffer state management.
-- Performant string/regex matching over partial streams.
-- Memory efficiency and low latency (must not buffer the whole response;
-  minimize TTFT).
-
-### Task 4 — Rate limiting & model fallback router
-Resilient model-routing module for an LLM Gateway: token-aware sliding
-window rate limiter (e.g. 50,000 tokens/minute per tenant API key);
-failover to a secondary model provider on primary 429 or >3000ms timeout;
-standardized error payloads that never leak upstream stack traces or
-internal details; on-disk SQLite for persistence.
-
-Evaluation criteria:
-- Async concurrency handling and timeout race conditions.
-- Accurate rate-limiter state eviction and token tracking.
-- Graceful fallback mechanics and standardized error sanitization.
-
-## Stack decisions
-
-- Python 3.12 (the repo's `mcp` SDK dependency needs >=3.10; system
-  `python3` on this machine is 3.9.6 and cannot be used — build the venv
-  with `python3.12`, confirmed available at `/opt/local/bin/python3.12`).
-- FastAPI + uvicorn for all HTTP-facing services (gateway, mocks).
-- httpx for all outbound HTTP calls (proxying, tests).
-- Pydantic v2 for all schema validation.
-- pytest for tests (sync `fastapi.testclient.TestClient`, including for
-  SSE streaming responses via `client.stream(...)` — no `pytest-asyncio`
-  dependency unless a later task genuinely needs an async test).
-- Ruff for linting and formatting (single tool, replaces
+- Python 3.12. The `mcp` SDK dependency requires >=3.10; the system
+  `python3` on the reference machine was 3.9.6 and could not be used —
+  the virtualenv is built explicitly with `python3.12`.
+- FastAPI + uvicorn for every HTTP-facing service (both gateways, the rate
+  limiter, both mocks).
+- httpx for all outbound HTTP calls, in both application code and tests
+  (including `httpx.ASGITransport` for in-process test clients against a
+  mock's FastAPI app, avoiding real sockets in the test suite).
+- Pydantic v2 for schema validation.
+- pytest, with the synchronous `fastapi.testclient.TestClient` throughout
+  — including for SSE streaming responses via `client.stream(...)` — so no
+  `pytest-asyncio` dependency was added; async code under test is driven
+  directly with `asyncio.run(...)` where a unit test needs to call a
+  coroutine outside a FastAPI request cycle.
+- Ruff for both linting and formatting (single tool, replaces
   black/flake8/isort).
-- Task 4's SQLite access is stdlib `sqlite3` from a threadpool
-  (`asyncio.to_thread`), not `aiosqlite` — chosen to avoid an extra
-  dependency; revisit if contention under concurrent load becomes a
-  problem.
-- Dependencies are pinned to exact versions in `pyproject.toml` (checked
-  against live PyPI at scaffold time, 2026-09-04) for reproducibility.
+- Task 4's SQLite access is stdlib `sqlite3` from a thread
+  (`asyncio.to_thread`) rather than `aiosqlite`, to avoid an extra
+  dependency for a single table with modest concurrency requirements.
+- Dependencies are pinned to exact versions in `pyproject.toml`.
 
-## Conventions
+## Architecture decisions
 
-- **stdout is sacred.** Every process in this repo (the stdio MCP server
-  above all, but gateways and mocks too) must never write anything but
-  protocol/response bytes to stdout. All logging — `logging` module
-  configured with a `StreamHandler(sys.stderr)` — goes to stderr. Never use
-  bare `print()` for anything other than an intentional protocol write.
-- **Tests live alongside the module they cover.** Every module gets tests
-  written in the same change that introduces it — not deferred to a later
-  pass. Mirror `src/<package>/foo.py` under `tests/<package>/test_foo.py`
-  (see `mocks/` + `tests/mocks/` for the pattern already in place).
+- **Package-per-task layout under `src/`.** `mcp_server/`, `mcp_gateway/`,
+  `llm_gateway/`, `rate_limiter/` are independent packages, each runnable
+  and testable on its own. `mocks/` is a separate top-level package, not
+  nested under `src/`, since it is test/development infrastructure rather
+  than a deliverable.
+- **Mocks built before the components that depend on them.** Both mock
+  upstreams were implemented first, with their controllable failure modes
+  (`rate_limited`, `slow`, `pii`) designed around what Tasks 2–4 would need
+  to exercise, so the gateways always had a real, deterministic upstream to
+  run against rather than being tested purely with hand-built fakes.
+- **Task 1 uses the low-level MCP `Server`, not the high-level
+  `MCPServer`.** On the installed SDK version (`mcp==2.1.1`), the
+  high-level server's tool dispatch (`_handle_call_tool`) deliberately
+  converts every exception except `MCPError` — including a Pydantic
+  `ValidationError` from a tool's own declared schema — into a successful
+  `CallToolResult(is_error=True)`, matching the current MCP specification's
+  convention that tool execution failures are reported in-band. That is the
+  opposite of this assessment's explicit requirement to reject invalid
+  input with standard JSON-RPC error codes. The low-level `Server` has no
+  such interception: an `MCPError` raised from the `on_call_tool` handler
+  propagates to the SDK's JSON-RPC dispatcher and is serialized as a
+  genuine protocol-level `error` response.
+- **Task 4 rate limiting is a sliding-window log, not a fixed-window
+  counter.** Every accepted request is recorded as
+  `(tenant_key, timestamp, tokens)`; a check sums a tenant's tokens within
+  the trailing window and evicts expired rows on every call. A fixed-window
+  counter was rejected because a client can burst up to roughly double the
+  limit's worth of tokens across a window boundary under that scheme.
+- **Task 3's redactor holds back a fixed 64-character tail rather than
+  buffering the response or redacting each chunk independently.**
+  Redacting each chunk in isolation silently misses any pattern split
+  across a chunk boundary, which the mock's `pii` behavior is designed to
+  exercise. Buffering the full response would satisfy correctness but
+  violate the task's explicit memory and latency requirements. The
+  holdback size must be at least as large as the longest pattern matched
+  (credit card, ~19 characters with separators); 64 was chosen with margin
+  for realistic email lengths while keeping the added latency small.
+- **Task 4's `RouterConfig` is a dependency, not a module-level constant.**
+  Primary URL, secondary URL, and timeout are wrapped in a small dataclass
+  exposed through a FastAPI dependency (`get_router_config`), matching the
+  same override pattern already used for the HTTP client and the rate
+  limiter, so tests substitute configuration the same way everywhere in the
+  repository rather than mutating global state.
 
-## Design decisions
+## Protocol and security decisions
 
-(Running log — add an entry each time we make a nontrivial call during
-implementation, most recent last.)
+- **JSON-RPC protocol errors vs. in-band tool errors (Task 1).**
+  Schema-invalid input or an unknown tool name is a protocol error
+  (`MCPError`, JSON-RPC `-32602 Invalid params`). A well-formed but
+  unfulfillable request (valid `customer_id` format, not present in the
+  fixture store) is a normal, successful result with
+  `CallToolResult(is_error=True)`, since the request itself was valid. Only
+  the first category uses a protocol-level error.
+- **Fail-closed authorization (Task 2).** An `admin_*` tool call is denied
+  by default; only an explicit `admin` role admits it. A denied call is
+  intercepted before any downstream request is constructed — the
+  downstream server is never contacted for it, including inside a batch
+  that also contains authorized calls.
+- **Authorization rule generalized beyond the two named methods (Task
+  2).** The specification's example is "`tools/list` forwards
+  transparently, `tools/call` to `admin_*` needs admin role." Implemented
+  as "every method forwards except an unauthorized `admin_*` tool call":
+  blocking every method that is not literally `tools/list` would break a
+  real client's `initialize`/`ping` handshake, which the specification does
+  not intend to block.
+- **Redaction operates on extracted content, not raw bytes (Task 3).**
+  The gateway parses each upstream SSE event and redacts only the
+  extracted `delta.content` text, then re-wraps the redacted text in a new
+  SSE frame. Redacting raw bytes across event boundaries would risk a
+  match spanning two separate JSON envelopes and corrupting one.
+- **Error sanitization on failover (Task 4).** All failure paths in
+  `complete_with_failover` funnel through a single `RouterError`, whose
+  message is the only thing that reaches the client. Upstream status
+  codes, connection errors, and other internal detail are logged
+  server-side and never included in the response body.
+- **stdout is reserved for protocol output (Task 1, all HTTP services by
+  extension).** All logging goes through the `logging` module configured
+  onto `sys.stderr`; no code path uses bare `print()`. The stdio
+  transport's own `stdio_server()` additionally diverts the process's real
+  file descriptor 1 to stderr for the duration of the connection and writes
+  the JSON-RPC wire through a separate, private descriptor, so the
+  convention is enforced structurally, not only by discipline.
 
-- 2026-09-04 — Scaffolded repo: package-per-task layout under `src/`, mock
-  upstreams (`mocks/mcp_downstream.py`, `mocks/llm_provider.py`) built
-  first so Tasks 2 and 3 have something real to run against. No task
-  logic implemented yet.
-- 2026-09-04 — `tests/__init__.py` is required and must stay. Without it,
-  pytest's default "prepend" import mode treats `tests/mocks/` as *the*
-  `mocks` package (since `tests/` had no `__init__.py` to keep walking
-  past), which shadows the real top-level `mocks/` package and breaks
+## Testing conventions
+
+- **Tests live alongside the module they cover**, written in the same
+  change that introduces the module. `tests/<package>/test_<module>.py`
+  mirrors `src/<package>/<module>.py`; the same pattern applies to
+  `mocks/` under `tests/mocks/`.
+- **`tests/__init__.py` is required and must stay.** Without it, pytest's
+  default "prepend" import mode treats `tests/mocks/` as *the* `mocks`
+  package (since `tests/` would otherwise be the first directory without an
+  `__init__.py`, and the dotted module name is built from there down),
+  shadowing the real top-level `mocks/` package and breaking
   `from mocks.foo import ...` in test files with a confusing
-  `ModuleNotFoundError`. Keep every future `tests/<x>/` directory name
-  distinct from a real top-level package name, or keep `tests/__init__.py`
-  in place — both are needed in general, but the `__init__.py` is the fix
-  that matters here.
-- 2026-09-04 — Verified the full harness end to end: `make install` (venv
-  via python3.12), `make lint` (ruff check + format, clean), `make test`
-  (20/20 passing), `./scripts/smoke.sh` (8/8 passing) all green.
-- 2026-09-04 — Task 1 implemented on `mcp==2.1.1`, which turned out to have
-  a materially different API from the 1.x SDK: `FastMCP` is gone
-  (`mcp.server.fastmcp` raises `ModuleNotFoundError` on import with a
-  migration pointer), replaced by `mcp.server.mcpserver.MCPServer`. More
-  importantly, `MCPServer`'s `_handle_call_tool` deliberately catches every
-  exception except `MCPError` — including the `ToolError`/`ValidationError`
-  it raises itself when a tool's declared argument schema doesn't match —
-  and turns it into a *successful* `CallToolResult(isError=True)`, per the
-  current MCP spec's convention that tool execution failures are in-band,
-  not protocol errors. That's the opposite of what the assessment spec asks
-  for ("Reject invalid formats with standard MCP JSON-RPC error codes").
-  So Task 1 uses `mcp.server.lowlevel.Server` instead: we validate arguments
-  ourselves against the Pydantic model and explicitly raise
-  `mcp.shared.exceptions.MCPError(code=INVALID_PARAMS, ...)`, which the
-  low-level dispatcher (`handler_exception_to_error_data` in
-  `mcp/shared/jsonrpc_dispatcher.py`) serializes as a genuine JSON-RPC
-  `error` response — confirmed by an actual subprocess test
-  (`tests/mcp_server/test_stdio_e2e.py`), not just a unit test. A
-  well-formed but nonexistent `customer_id` is treated differently: that's
-  a valid request that can't be fulfilled, so it returns a normal
-  `CallToolResult(isError=True)`, matching current MCP convention — only
-  schema-invalid input and unknown tool names get the protocol-level error.
-  Also confirmed (by reading `mcp/server/stdio.py`) that `stdio_server()` in
-  this SDK version already hardens stdout itself: while serving, it diverts
-  the process's real fd 1 to stderr and drives the JSON-RPC wire through a
-  private duplicated descriptor, so a stray `print()` anywhere lands on
-  stderr, not the wire, by construction — the "never print to stdout"
-  convention is now defense in depth on top of that, not the only guard.
-- 2026-09-06 — Task 2 implemented. Two decisions worth recording:
-  (1) Bearer-token → role mapping is a static in-memory dict
-  (`mcp_gateway/auth.py`) since there's no real identity provider in scope —
-  documented in the module docstring as a stand-in, swappable without
-  touching the authorization logic. (2) The spec's rule ("`tools/list`
-  forwards transparently, `tools/call` to `admin_*` needs admin role") is
-  generalized to "everything forwards except an unauthorized `admin_*` tool
-  call": blocking every method that isn't literally `tools/list` would break
-  a real client's `initialize`/`ping` handshake, which the spec surely
-  doesn't intend. Also extended proxying to JSON-RPC batches (the downstream
-  mock already supports them): each item in a batch is authorized
-  independently, only the authorized subset goes downstream in one call,
-  responses are merged back in original order — proven with a test that
-  sends one allowed + one blocked call in the same batch and asserts the
-  downstream only ever saw the allowed one.
-- 2026-09-07 — Task 3 implemented: a bounded "holdback buffer" redactor
-  (`llm_gateway/redactor.py`). Each `feed()` re-runs the redaction regex
-  over `<held-back tail> + <new chunk>` — a small, bounded string, never the
-  whole response — and only ever emits everything except the last
-  `HOLDBACK` (64) characters, which might still be the start of an
-  in-progress match. Chosen over buffering the whole response (violates the
-  spec directly) and over a naive "redact each chunk independently"
-  approach (silently misses any pattern split across a chunk boundary,
-  which the mock's `pii` behavior deliberately exercises). `HOLDBACK=64` is
-  a documented trade-off: must be at least the longest pattern we match
-  (credit card ~19 chars is the longest), and larger values are safer
-  against very long splits but directly cost latency, since nothing can be
-  emitted until more than 64 characters have arrived. Redaction runs on the
-  *extracted* SSE delta content, not raw bytes, so a match can never
-  straddle two JSON envelopes and corrupt one.
-  Manually running the gateway against the real mock over actual HTTP (not
-  just the in-process test client) surfaced a real bug the tests didn't
-  catch: the naive `buffer[:-HOLDBACK]` cut could land inside the literal
-  `"[REDACTED]"` marker itself, e.g. one SSE event ending in `"...[REDA"`
-  and the next starting with `"CTED]..."`. Not a PII leak (concatenated,
-  the stream was always correct — that's why the existing reassembly-based
-  tests passed despite the bug), but it looks broken to any consumer that
-  doesn't reassemble the whole stream before reading it. Fixed by pulling
-  the split point back before a `[REDACTED]` occurrence it would otherwise
-  cut through (`PiiStreamRedactor._safe_split_point`), plus a regression
-  test asserting no emission ends/starts with a partial marker fragment.
-  Worth remembering generally: an in-process TestClient run isn't a full
-  substitute for actually curling two real separate processes — this is
-  the second bug this project has only surfaced that way (the smoke.sh
-  `check()`-argument bug earlier was the first).
+  `ModuleNotFoundError`. The same risk applies to any future
+  `tests/<x>/` directory whose name collides with a real top-level package.
+- **Four verification layers, kept distinct**: unit tests (a single
+  function or class), integration tests (a full FastAPI app in-process
+  against an in-process mock via `httpx.ASGITransport`), live multi-process
+  checks (real `uvicorn` processes exercised with `curl` or a real
+  subprocess), and the smoke script (`scripts/smoke.sh`, both mocks started
+  as real processes and checked directly). An in-process test client does
+  not fully substitute for exercising real, separate processes over a real
+  transport — this repository caught two defects only that way (see dated
+  log below): a shell-scripting bug in `smoke.sh`'s `check()` invocation,
+  and a PII redaction marker split across two SSE frames.
+- **Manual verification commands are kept accurate to the actual running
+  configuration** — real ports, real environment variable names, no
+  placeholder values — since a command that does not match the code is
+  worse than no command. See `README.md` for the current set.
+
+## Dated design decisions
+
+- 2026-09-04 — Repository scaffolded: package-per-task layout, both mock
+  upstreams built first, `tests/__init__.py` requirement discovered and
+  fixed (see Testing conventions). Full harness verified end to end.
+- 2026-09-04 — Task 1 implemented on `mcp==2.1.1`. `FastMCP` no longer
+  exists in this major version (renamed to `mcp.server.mcpserver.MCPServer`
+  with materially different tool-error behavior); the low-level `Server`
+  was used instead so that schema-invalid input surfaces as a JSON-RPC
+  protocol error rather than an in-band tool result — see Architecture
+  decisions and Protocol and security decisions above. Verified with a real
+  subprocess stdio session (`tests/mcp_server/test_stdio_e2e.py`), not only
+  handler-level unit tests, since only a real subprocess can confirm what
+  actually reaches the process's stdout.
+- 2026-09-06 — Task 2 implemented. Bearer-token-to-role mapping documented
+  as a static stand-in (`mcp_gateway/auth.py`); authorization rule
+  generalized beyond the specification's two named methods; batch support
+  extended to the gateway since the downstream mock already supports it,
+  with per-item authorization proven by a test asserting a blocked call
+  inside a mixed batch never reaches the downstream server.
+- 2026-09-07 — Task 3 implemented: bounded holdback-buffer redactor (see
+  Architecture decisions). A defect was found only by running the gateway
+  against the real mock over actual HTTP, not by the in-process test
+  suite: the naive `buffer[:-HOLDBACK]` cut could land inside the literal
+  `[REDACTED]` marker itself, splitting it across two SSE emissions (for
+  example, one event ending `"...[REDA"` and the next starting
+  `"CTED]..."`). Not a PII leak — the fully concatenated stream was always
+  correct, which is why the existing reassembly-based tests passed despite
+  the defect — but a marker torn across two emissions is incorrect on the
+  wire for any consumer that does not reassemble first. Fixed by pulling
+  the split point back before any `[REDACTED]` occurrence it would
+  otherwise cut through, with a regression test added asserting no
+  emission ends or starts with a partial marker fragment.
 - 2026-09-07 — Task 4 implemented, the last of the four. Token cost is
-  caller-declared (`max_tokens` in the request body, OpenAI-style) rather
-  than estimated from prompt length — confirmed with the user, since
-  there's no real tokenizer in scope and an estimate wouldn't account for
-  response tokens anyway. The rate limiter is a sliding-window *log* in
-  SQLite (record every accepted request's tokens+timestamp, sum the
-  trailing 60s window, evict older rows each check) rather than a
-  fixed-window counter, specifically to avoid the standard fixed-window bug
-  where a client can burst up to 2x the limit across a window boundary. A
-  fresh `sqlite3` connection per call (not a shared one) sidesteps
-  same-thread restrictions under `asyncio.to_thread`; a per-tenant
-  `asyncio.Lock` closes the real race, which is check-then-record
-  (TOCTOU) under concurrency, not a SQLite locking problem — proven with a
-  test firing 30 concurrent requests at a 1000-token budget and asserting
-  the accepted total is exactly 1000.
-  Initially wired primary/secondary URLs as module-level globals that
-  tests mutated directly for override — inconsistent with the
-  dependency-override pattern used everywhere else in this repo (Tasks 2
-  and 3), and fragile (order-dependent test pollution risk). Refactored to
-  a `RouterConfig` dataclass behind its own `Depends()`, matching the
-  established pattern, before calling it done.
-  Verified failover with three genuinely separate live processes (primary,
-  secondary, gateway), not just the test suite: primary configured to
-  sleep 2s against a 1s timeout correctly failed over in ~1.1s wall-clock,
-  confirmed via the gateway's own log line
-  (`primary model failed (TimeoutError()); failing over to secondary`).
+  caller-declared (`max_tokens`) rather than estimated from prompt length,
+  since no tokenizer is in scope and an estimate would not account for
+  response tokens. The rate limiter's per-tenant `asyncio.Lock` closes a
+  check-then-act race under concurrency, validated by a test firing 30
+  concurrent requests at a 1,000-token budget and asserting the accepted
+  total is exactly 1,000. Primary/secondary configuration was initially
+  wired as module-level globals that tests mutated directly; refactored to
+  a `RouterConfig` dataclass behind its own dependency before being
+  considered complete, for consistency with the override pattern used
+  elsewhere in the repository. Failover was verified with three separate
+  live processes (primary, secondary, router): a primary configured to
+  sleep 2 seconds against a 1-second timeout correctly failed over in
+  approximately 1.1 seconds wall-clock.
+
+## Known limitations
+
+- The MCP gateway's Bearer-token-to-role mapping is a static lookup table,
+  a stand-in for a real identity provider, documented in
+  `mcp_gateway/auth.py` and swappable without touching the authorization
+  logic.
+- Both mock upstreams are test infrastructure, not reference
+  implementations of a real MCP server or LLM provider.
+- Task 4 accepts `max_tokens` as the declared cost of a request because no
+  tokenizer is in scope; the rate limiter enforces budget against that
+  declared value, not a computed one.
+- Task 4's router collects the full completion from a provider rather than
+  streaming it back to the client — its evaluation criteria are about
+  rate-limiter accounting and failover mechanics, not streaming delivery,
+  which Task 3 already demonstrates.
+- The rate limiter's primary/secondary URLs and timeout are read from
+  environment variables once at process start; there is no per-request
+  override of upstream target, unlike the Task 3 gateway's forwarding of
+  the mock's own behavior-selection header and query parameter.
